@@ -23,7 +23,7 @@ class DataLoader:
         return df
     
     @staticmethod
-    def load_all_data(data_folder='data'):
+    def load_all_data(data_folder='data/hourly'):
         """Loads all JSON files from the data folder"""
         data = {}
         for file in os.listdir(data_folder):
@@ -31,13 +31,13 @@ class DataLoader:
                 path = os.path.join(data_folder, file)
                 # Extract cryptocurrency symbol from the filename
                 symbol = file.split('_')[0].replace('usd', '')
+                print(symbol)
                 try:
                     data[symbol] = DataLoader.load_file(path)
                     print(f"Loaded: {symbol} - {len(data[symbol])} records")
                 except Exception as e:
                     print(f"Error loading {file}: {e}")
         return data
-
 
 class PriceDataProcessor:
     """Processes price data for strategy execution"""
@@ -522,21 +522,17 @@ class HourlyTopPerformersWithStopLoss(Strategy):
         self.holdings_history = {}
         self.stop_loss_events = []
         
-        # We need to check for stop loss between rebalance dates
         for i, rebalance_date in enumerate(rebalance_dates):
             # Get the next rebalance date or the end date
             next_rebalance = rebalance_dates[i+1] if i < len(rebalance_dates) - 1 else end_date
             
-            # Skip if we're beyond our date range
             if rebalance_date > end_date:
                 break
                 
-            # Get top performers for this period
             if rebalance_date in returns_df.index:
                 returns_at_date = returns_df.loc[rebalance_date]
                 top_performers = returns_at_date.nlargest(self.num_top_coins).index.tolist()
                 
-                # Record holdings for this period
                 period_key = rebalance_date.strftime('%Y-%m-%d-%H')
                 self.holdings_history[period_key] = top_performers
                 
@@ -622,3 +618,514 @@ class HourlyTopPerformersWithStopLoss(Strategy):
                 price = price_df.loc[timestamp, symbol]
                 crypto_value += units * price
         return crypto_value
+    
+    def _create_stop_loss_events_chart(self, price_df):
+        """Create visualization of stop loss events"""
+        if not self.stop_loss_events:
+            print("No stop loss events to visualize.")
+            return
+        
+        # Get top coins with stop loss events
+        symbol_count = {}
+        for event in self.stop_loss_events:
+            symbol = event['symbol']
+            if symbol in symbol_count:
+                symbol_count[symbol] += 1
+            else:
+                symbol_count[symbol] = 1
+        
+        # Get top 5 coins with most stop loss events
+        top_symbols = sorted(symbol_count.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_symbol_names = [s[0] for s in top_symbols]
+        
+        print(f"\nTop cryptocurrencies with stop loss events:")
+        for symbol, count in top_symbols:
+            print(f"  {symbol.upper()}: {count} events")
+        
+        # Create figure for each of the top coins
+        for symbol in top_symbol_names:
+            # Get all events for this symbol
+            symbol_events = [e for e in self.stop_loss_events if e['symbol'] == symbol]
+            
+            if not symbol_events:
+                continue
+                
+            try:
+                # Create price chart with stop loss markers
+                fig = go.Figure()
+                
+                # Find the earliest and latest timestamps
+                earliest_timestamp = min(e['timestamp'] for e in symbol_events)
+                latest_timestamp = max(e['timestamp'] for e in symbol_events)
+                
+                # Add some padding before and after
+                padding = pd.Timedelta(hours=24)
+                chart_start = earliest_timestamp - padding
+                chart_end = latest_timestamp + padding
+                
+                # Make sure these timestamps are in our price data
+                chart_start = max(chart_start, price_df.index[0])
+                chart_end = min(chart_end, price_df.index[-1])
+                
+                # Add price line
+                if symbol in price_df.columns:
+                    symbol_data = price_df[symbol].loc[chart_start:chart_end]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=symbol_data.index,
+                            y=symbol_data.values,
+                            mode='lines',
+                            name=f'{symbol} Price',
+                            line=dict(color='blue', width=1)
+                        )
+                    )
+                
+                # Add stop loss events as markers
+                fig.add_trace(
+                    go.Scatter(
+                        x=[e['timestamp'] for e in symbol_events],
+                        y=[e['price'] for e in symbol_events],
+                        mode='markers',
+                        name='Stop Loss Triggered',
+                        marker=dict(color='red', size=8, symbol='x')
+                    )
+                )
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"Stop Loss Events for {symbol.upper()} ({len(symbol_events)} events)",
+                    xaxis_title="Date",
+                    yaxis_title="Price",
+                    template='plotly_white'
+                )
+                
+                fig.show()
+            except Exception as e:
+                print(f"Error creating chart for {symbol}: {e}")
+        
+        try:
+            # Create summary chart of stop loss events
+            # Group by date (day)
+            event_dates = [pd.to_datetime(e['timestamp']).date() for e in self.stop_loss_events]
+            date_counts = {}
+            for date in event_dates:
+                date_str = date.strftime('%Y-%m-%d')
+                if date_str in date_counts:
+                    date_counts[date_str] += 1
+                else:
+                    date_counts[date_str] = 1
+            
+            # Convert to DataFrame
+            events_df = pd.DataFrame(list(date_counts.items()), columns=['Date', 'Count'])
+            events_df['Date'] = pd.to_datetime(events_df['Date'])
+            events_df = events_df.sort_values('Date')
+            
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=events_df['Date'],
+                    y=events_df['Count'],
+                    marker_color='red'
+                )
+            )
+            
+            fig.update_layout(
+                title="Daily Stop Loss Events",
+                xaxis_title="Date",
+                yaxis_title="Number of Stop Loss Events",
+                template='plotly_white'
+            )
+            
+            fig.show()
+        except Exception as e:
+            print(f"Error creating stop loss summary chart: {e}")
+
+
+class TopPerformersStrategy(Strategy):
+    """Implements a strategy that buys the top performing cryptocurrencies each period"""
+    
+    def __init__(self, lookback_period=7, num_top_coins=5, initial_capital=10000, commission=0.001):
+        super().__init__(initial_capital, commission)
+        self.lookback_period = lookback_period
+        self.num_top_coins = num_top_coins
+        
+    def __str__(self):
+        """String representation of the strategy"""
+        return f"Top {self.num_top_coins} Performers Strategy ({self.lookback_period}-day lookback)"
+        
+    def run(self, price_df, start_date, end_date, btc_data=None):
+        """
+        Run the top performers strategy
+        
+        Parameters:
+        -----------
+        price_df : DataFrame
+            DataFrame with cryptocurrency prices
+        start_date : datetime
+            Start date for the strategy
+        end_date : datetime
+            End date for the strategy
+        btc_data : DataFrame, optional
+            Bitcoin data for benchmarking
+            
+        Returns:
+        --------
+        DataFrame: Portfolio performance data
+        """
+        print(f"\nRunning {self} from {start_date} to {end_date}")
+        print(f"Initial capital: ${self.initial_capital:,.2f}")
+        
+        # Calculate returns for ranking
+        returns_df = price_df.pct_change(self.lookback_period).dropna()
+        
+        # Create rebalance dates (every Monday)
+        start_monday = start_date + timedelta(days=(7 - start_date.weekday()) % 7)
+        end_monday = end_date - timedelta(days=end_date.weekday())
+        rebalance_dates = pd.date_range(start=start_monday, end=end_monday, freq='W-MON')
+        
+        print(f"Strategy will run from {start_monday.date()} to {end_monday.date()} with {len(rebalance_dates)} rebalance points")
+        
+        # Initialize portfolio tracking
+        portfolio_df = pd.DataFrame(index=price_df.loc[start_monday:end_date].index)
+        portfolio_df['Cash'] = self.initial_capital
+        portfolio_df['Crypto_Value'] = 0.0
+        portfolio_df['Total_Value'] = self.initial_capital
+        
+        # Add equal-weight benchmark
+        self._add_equal_weight_benchmark(portfolio_df, price_df, start_monday)
+        
+        # Add BTC benchmark if available
+        if btc_data is not None and 'btc' in price_df.columns:
+            self._add_btc_benchmark(portfolio_df, price_df, start_monday)
+        
+        # Run the strategy
+        self._run_rebalancing_strategy(portfolio_df, price_df, returns_df, rebalance_dates, end_date)
+        
+        # Calculate metrics
+        result_df = self.calculate_metrics(portfolio_df, start_monday, end_date, btc_data)
+        
+        # Create visualizations
+        self._create_performance_chart(result_df)
+        self._create_holdings_chart()
+        
+        return result_df
+    
+    def _run_rebalancing_strategy(self, portfolio_df, price_df, returns_df, rebalance_dates, end_date):
+        """Execute the rebalancing strategy"""
+        current_holdings = {}
+        current_cash = self.initial_capital
+        self.holdings_history = {}
+        
+        for i, rebalance_date in enumerate(rebalance_dates):
+            # Get the next rebalance date or the end date
+            next_rebalance = rebalance_dates[i+1] if i < len(rebalance_dates) - 1 else end_date
+            next_day = min(next_rebalance, end_date)
+            
+            # Skip if we're beyond our date range
+            if rebalance_date > end_date:
+                break
+                
+            # Get top performers for this period
+            if rebalance_date in returns_df.index:
+                returns_at_date = returns_df.loc[rebalance_date]
+                top_performers = returns_at_date.nlargest(self.num_top_coins).index.tolist()
+                
+                # Record holdings for this period
+                week_key = rebalance_date.strftime('%Y-%W')
+                self.holdings_history[week_key] = top_performers
+                
+                # Sell current holdings
+                current_cash = self._sell_holdings(current_holdings, price_df, rebalance_date, current_cash)
+                
+                # Buy new top performers
+                current_holdings = self._buy_new_holdings(top_performers, price_df, rebalance_date, current_cash)
+                current_cash = 0  # All cash is allocated
+                
+                # Update portfolio for this period
+                self._update_portfolio_values(
+                    portfolio_df, current_holdings, current_cash, price_df, 
+                    rebalance_date, next_day
+                )
+    
+    def _update_portfolio_values(self, portfolio_df, holdings, cash, price_df, start_date, end_date):
+        """Update portfolio values for the current period"""
+        date_range = pd.date_range(start_date, end_date - timedelta(days=1))
+        for day in date_range:
+            if day in portfolio_df.index:
+                crypto_value = 0
+                for symbol, units in holdings.items():
+                    if symbol in price_df.columns and day in price_df.index:
+                        price = price_df.loc[day, symbol]
+                        crypto_value += units * price
+                
+                portfolio_df.loc[day, 'Cash'] = cash
+                portfolio_df.loc[day, 'Crypto_Value'] = crypto_value
+                portfolio_df.loc[day, 'Total_Value'] = cash + crypto_value
+
+
+class CryptoBacktester:
+    """Main class to handle backtesting of crypto strategies"""
+    
+    def __init__(self, data_folder='data'):
+        """Initialize the backtester"""
+        self.data = DataLoader.load_all_data(data_folder)
+    
+    def find_common_date_range(self, valid_cryptos):
+        """Find common date range for all cryptocurrencies"""
+        start_dates = [data.index.min() for data in valid_cryptos.values()]
+        end_dates = [data.index.max() for data in valid_cryptos.values()]
+        
+        common_start = max(start_dates)
+        common_end = min(end_dates)
+        
+        print(f"Common date range: {common_start} to {common_end}")
+        return common_start, common_end
+    
+    def filter_valid_cryptos(self, lookback_period):
+        """Filter cryptocurrencies with sufficient data"""
+        valid_cryptos = {}
+        for symbol, data in self.data.items():
+            print(data)
+            if len(data) > lookback_period + 10:  # Ensure enough data
+                valid_cryptos[symbol] = data
+        
+        print(f"Found {len(valid_cryptos)} cryptocurrencies with sufficient data")
+        return valid_cryptos
+    
+    def run_backtest(self, strategy, lookback_period=7, custom_start_date=None, custom_end_date=None):
+        """
+        Run a backtest with the given strategy
+        
+        Parameters:
+        -----------
+        strategy : Strategy
+            The strategy to backtest
+        lookback_period : int
+            Number of days to look back for performance calculation
+        custom_start_date : str or datetime, optional
+            Custom start date in 'YYYY-MM-DD' format or datetime object
+        custom_end_date : str or datetime, optional
+            Custom end date in 'YYYY-MM-DD' format or datetime object
+        
+        Returns:
+        --------
+        tuple: (result_df, metrics)
+            result_df: DataFrame with portfolio performance
+            metrics: Dictionary with performance metrics
+        """
+        # Filter cryptocurrencies with sufficient data
+        valid_cryptos = self.filter_valid_cryptos(lookback_period)
+        print(f"Valid cryptocurrencies: {list(valid_cryptos.keys())}")
+        if len(valid_cryptos) == 0:
+            print("Error: No cryptocurrencies with sufficient data found.")
+            return None, None
+        
+        # Check for BTC data for benchmark
+        btc_data = valid_cryptos.get('btc')
+        if btc_data is None:
+            print("Warning: Bitcoin data not found. Cannot use as benchmark.")
+        
+        # Find common date range
+        common_start, common_end = self.find_common_date_range(valid_cryptos)
+        
+        # Apply custom date range if provided
+        start_date = common_start
+        end_date = common_end
+        
+        if custom_start_date is not None:
+            if isinstance(custom_start_date, str):
+                custom_start_date = pd.to_datetime(custom_start_date)
+            start_date = max(common_start, custom_start_date)
+            print(f"Using custom start date: {start_date}")
+        
+        if custom_end_date is not None:
+            if isinstance(custom_end_date, str):
+                custom_end_date = pd.to_datetime(custom_end_date)
+            end_date = min(common_end, custom_end_date)
+            print(f"Using custom end date: {end_date}")
+        
+        # Validate date range
+        if start_date >= end_date:
+            print("Error: Start date must be before end date.")
+            return None, None
+        
+        # Make sure we have enough data before the start date for lookback calculations
+        adjusted_start = start_date - timedelta(days=lookback_period*2)
+        
+        # Create price dataframe
+        price_df = PriceDataProcessor.create_price_dataframe(
+            valid_cryptos, adjusted_start, end_date, lookback_period
+        )
+        
+        print(f"Price dataframe shape: {price_df.shape}")
+        
+        # Run the strategy
+        result_df = strategy.run(price_df, start_date, end_date, btc_data)
+        
+        # Print metrics
+        strategy.print_metrics()
+        
+        return result_df, strategy.metrics
+
+
+class HourlyBacktester(CryptoBacktester):
+    """Backtester for hourly cryptocurrency data"""
+    
+    def run_backtest(self, strategy, lookback_period=24, custom_start_date=None, custom_end_date=None):
+        """
+        Run a backtest with the given strategy on hourly data
+        
+        Parameters:
+        -----------
+        strategy : Strategy
+            The strategy to backtest
+        lookback_period : int
+            Number of hours to look back for performance calculation
+        custom_start_date : str or datetime, optional
+            Custom start date in 'YYYY-MM-DD HH:MM:SS' format or datetime object
+        custom_end_date : str or datetime, optional
+            Custom end date in 'YYYY-MM-DD HH:MM:SS' format or datetime object
+        """
+        # Filter cryptocurrencies with sufficient data
+        valid_cryptos = self.filter_valid_cryptos(lookback_period)
+        
+        if len(valid_cryptos) == 0:
+            print("Error: No cryptocurrencies with sufficient data found.")
+            return None, None
+        
+        # Check for BTC data for benchmark
+        btc_data = valid_cryptos.get('btc')
+        if btc_data is None:
+            print("Warning: Bitcoin data not found. Cannot use as benchmark.")
+        
+        # Find common date range
+        common_start, common_end = self.find_common_date_range(valid_cryptos)
+        
+        # Apply custom date range if provided
+        start_date = common_start
+        end_date = common_end
+        
+        if custom_start_date is not None:
+            if isinstance(custom_start_date, str):
+                custom_start_date = pd.to_datetime(custom_start_date)
+            start_date = max(common_start, custom_start_date)
+            print(f"Using custom start date: {start_date}")
+        
+        if custom_end_date is not None:
+            if isinstance(custom_end_date, str):
+                custom_end_date = pd.to_datetime(custom_end_date)
+            end_date = min(common_end, custom_end_date)
+            print(f"Using custom end date: {end_date}")
+        
+        # Validate date range
+        if start_date >= end_date:
+            print("Error: Start date must be before end date.")
+            return None, None
+        
+        # Make sure we have enough data before the start date for lookback calculations
+        adjusted_start = start_date - pd.Timedelta(hours=lookback_period*2)
+        
+        # Create hourly price dataframe
+        price_df = HourlyDataProcessor.create_hourly_price_dataframe(
+            valid_cryptos, adjusted_start, end_date, lookback_period
+        )
+        
+        print(f"Price dataframe shape: {price_df.shape}")
+        
+        # Run the strategy
+        result_df = strategy.run(price_df, start_date, end_date, btc_data)
+        
+        # Print metrics
+        strategy.print_metrics()
+        
+        return result_df, strategy.metrics
+
+
+def main():
+    """Main function to run the backtester"""
+    import argparse
+    
+    # Set up command line argument parsing
+    parser = argparse.ArgumentParser(description='Cryptocurrency Trading Strategy Backtester')
+    parser.add_argument('--start_date', type=str, help='Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)')
+    parser.add_argument('--end_date', type=str, help='End date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)')
+    parser.add_argument('--lookback', type=int, default=24, help='Lookback period in hours (default: 24)')
+    parser.add_argument('--top_n', type=int, default=5, help='Number of top coins to select (default: 5)')
+    parser.add_argument('--capital', type=float, default=10000, help='Initial capital (default: 10000)')
+    parser.add_argument('--stop_loss', type=float, default=0.05, help='Stop loss percentage (default: 0.05)')
+    parser.add_argument('--stop_window', type=int, default=4, help='Stop loss window in hours (default: 4)')
+    parser.add_argument('--hourly', action='store_true', help='Use hourly data strategy with stop loss')
+    parser.add_argument('--save_results', action='store_true', help='Save performance results to CSV')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    if args.hourly:
+        # Create hourly backtester instance
+        backtester = HourlyBacktester()
+        
+        # Create hourly strategy with stop loss
+        strategy = HourlyTopPerformersWithStopLoss(
+            lookback_period=args.lookback,
+            num_top_coins=args.top_n,
+            initial_capital=args.capital,
+            stop_loss_pct=args.stop_loss,
+            stop_loss_window=args.stop_window
+        )
+        
+        print(f"\n===== Testing Hourly Strategy with {args.lookback}-hour lookback and {args.stop_loss:.1%} stop loss =====")
+        result_df, metrics = backtester.run_backtest(
+            strategy,
+            lookback_period=args.lookback,
+            custom_start_date=args.start_date,
+            custom_end_date=args.end_date
+        )
+    else:
+        # Create regular backtester instance
+        backtester = CryptoBacktester()
+        
+        # Create regular strategy
+        strategy = TopPerformersStrategy(
+            lookback_period=args.lookback,
+            num_top_coins=args.top_n,
+            initial_capital=args.capital
+        )
+        
+        print(f"\n===== Testing Top {args.top_n} Strategy with {args.lookback}-day lookback =====")
+        result_df, metrics = backtester.run_backtest(
+            strategy,
+            lookback_period=args.lookback,
+            custom_start_date=args.start_date,
+            custom_end_date=args.end_date
+        )
+    
+    if result_df is not None:
+        print("\nBacktest completed successfully!")
+        
+        # Save results if requested
+        if args.save_results:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Save metrics to CSV
+            metrics_df = pd.DataFrame([metrics])
+            metrics_file = f"metrics_{timestamp}.csv"
+            metrics_df.to_csv(metrics_file, index=False)
+            print(f"Metrics saved to {metrics_file}")
+            
+            # Save daily performance data
+            results_file = f"performance_{timestamp}.csv"
+            result_df.to_csv(results_file)
+            print(f"Performance data saved to {results_file}")
+            
+            # Save summary of stop loss events for hourly strategy
+            if args.hourly and hasattr(strategy, 'stop_loss_events') and strategy.stop_loss_events:
+                stop_loss_data = pd.DataFrame(strategy.stop_loss_events)
+                stop_loss_file = f"stop_loss_events_{timestamp}.csv"
+                stop_loss_data.to_csv(stop_loss_file, index=False)
+                print(f"Stop loss events saved to {stop_loss_file}")
+    else:
+        print("\nBacktest failed.")
+
+
+if __name__ == "__main__":
+    main()
