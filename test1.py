@@ -593,10 +593,18 @@ def top_performers_strategy(crypto_data, lookback_period=7, num_top_coins=5, ini
     
     fig.show()
     
-    # Create additional chart showing holdings over time
+    # Create a visualization of holdings over time
     if holdings_history:
         # Convert to DataFrame for better visualization
-        holdings_df = pd.DataFrame(index=pd.to_datetime(list(holdings_history.keys()), format='%Y-%W').map(lambda x: x.to_pydatetime()))
+        # Fix the date conversion by adding a day component (Monday = day 1 of the week)
+        holdings_dates = []
+        for week_key in holdings_history.keys():
+            year, week = week_key.split('-')
+            # Create a proper date from year and week - adding day 1 (Monday)
+            date = pd.to_datetime(f"{year}-{week}-1", format="%Y-%W-%w")
+            holdings_dates.append(date)
+            
+        holdings_df = pd.DataFrame(index=holdings_dates)
         
         # Get all unique cryptos held
         all_cryptos = list(unique_cryptos_held)
@@ -606,8 +614,8 @@ def top_performers_strategy(crypto_data, lookback_period=7, num_top_coins=5, ini
             holdings_df[crypto] = 0
         
         # Fill in holdings
-        for week, held_cryptos in holdings_history.items():
-            week_date = pd.to_datetime(week, format='%Y-%W').to_pydatetime()
+        for i, (week, held_cryptos) in enumerate(holdings_history.items()):
+            week_date = holdings_dates[i]
             for crypto in held_cryptos:
                 if crypto in holdings_df.columns:
                     holdings_df.loc[week_date, crypto] = 1
@@ -615,93 +623,7 @@ def top_performers_strategy(crypto_data, lookback_period=7, num_top_coins=5, ini
         # Count how many cryptos were held each week
         holdings_df['Total_Held'] = holdings_df.sum(axis=1)
         
-        # Visualize holdings distribution
-        top_n = 20  # Show top 20 most frequently held cryptos
-        holding_counts = holdings_df[all_cryptos].sum().sort_values(ascending=False).head(top_n)
-        
-        fig2 = go.Figure(data=[
-            go.Bar(
-                x=holding_counts.index,
-                y=holding_counts.values,
-                marker_color='blue'
-            )
-        ])
-        
-        fig2.update_layout(
-            title=f"Top {top_n} Most Frequently Held Cryptocurrencies",
-            xaxis_title="Cryptocurrency",
-            yaxis_title="Weeks Held",
-            template='plotly_white'
-        )
-        
-        fig2.show()
     
-    # Create a visualization of stop loss events if any occurred
-    if stop_loss_events:
-        stop_loss_df = pd.DataFrame(stop_loss_events)
-        
-        # Group by symbol and count occurrences
-        symbol_counts = stop_loss_df['symbol'].value_counts().head(10)
-        
-        fig3 = go.Figure(data=[
-            go.Bar(
-                x=symbol_counts.index,
-                y=symbol_counts.values,
-                marker_color='red'
-            )
-        ])
-        
-        fig3.update_layout(
-            title="Top Cryptocurrencies Triggering Stop Loss",
-            xaxis_title="Cryptocurrency",
-            yaxis_title="Number of Stop Loss Events",
-            template='plotly_white'
-        )
-        
-        fig3.show()
-        
-        # Show distribution of price drops at stop loss
-        fig4 = go.Figure(data=[
-            go.Histogram(
-                x=stop_loss_df['drop_pct'] * 100,
-                nbinsx=20,
-                marker_color='red'
-            )
-        ])
-        
-        fig4.update_layout(
-            title="Distribution of Price Drops at Stop Loss",
-            xaxis_title="Price Drop (%)",
-            yaxis_title="Frequency",
-            template='plotly_white'
-        )
-        
-        fig4.update_xaxes(ticksuffix="%")
-        
-        fig4.show()
-    
-    # Create a DataFrame of trades for analysis
-    if trade_history:
-        trades_df = pd.DataFrame(trade_history)
-        trades_df['date'] = pd.to_datetime(trades_df['date'])
-        
-        # Analyze trades by reason
-        reason_counts = trades_df['reason'].value_counts()
-        
-        fig5 = go.Figure(data=[
-            go.Pie(
-                labels=reason_counts.index,
-                values=reason_counts.values,
-                hole=0.4
-            )
-        ])
-        
-        fig5.update_layout(
-            title="Trade Distribution by Reason",
-            template='plotly_white'
-        )
-        
-        fig5.show()
     
     return daily_strategy_data, metrics
 
